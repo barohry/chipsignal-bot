@@ -1,9 +1,9 @@
 name: Chip Signal Scheduler
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"   # 10분마다
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # 15분마다
 
 jobs:
   run:
@@ -16,7 +16,9 @@ jobs:
       - name: Restore state cache
         uses: actions/cache@v4
         with:
-          path: state.json
+          path: |
+            state.json
+            archive.jsonl
           key: chip-signal-state-${{ github.run_id }}
           restore-keys: |
             chip-signal-state-
@@ -35,14 +37,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-5-mini
-          TOP_K: "7"
+          MAX_POSTS_PER_RUN: "2"
+          LOOKBACK_HOURS: "48"
         run: |
           python main.py
 
-      - name: Save state to cache
+      - name: Save state cache
         uses: actions/cache@v4
         with:
-          path: state.json
+          path: |
+            state.json
+            archive.jsonl
           key: chip-signal-state-${{ github.run_id }}
