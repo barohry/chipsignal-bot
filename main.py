@@ -11,8 +11,8 @@ CHAT_ID = os.getenv("@chipsignal", "")  # 예: "@chipsignal"
 KST = timezone(timedelta(hours=9))
 
 SCHEDULE = [
-    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 10},
-    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 10},
+    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
+    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
 ]
 
 def load_state():
