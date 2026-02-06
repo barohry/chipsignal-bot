@@ -17,8 +17,8 @@ KST = timezone(timedelta(hours=9))
 
 # 발행 시간(한국시간)과 허용 윈도우(분)
 SCHEDULE = [
-    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 10},
-    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 10},
+    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
+    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
 ]
 
 # ✅ 지금 테스트할 때만 1로 켜세요. (state.json 무시하고 강제 발행)
