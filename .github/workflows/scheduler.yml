@@ -3,7 +3,7 @@ name: Chip Signal Scheduler
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # 15분마다
+    - cron: "*/30 * * * *"   # 15분마다
 
 jobs:
   run:
