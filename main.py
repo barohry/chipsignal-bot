@@ -19,12 +19,14 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # e.g., "@chipsignal"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # 비용/속도 균형. 필요시 교체
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # 기본을 5-mini로
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 KST = timezone(timedelta(hours=9))
 
 # 발행 시간(한국시간)과 허용 윈도우(분)
+# ⚠️ window_minutes=720(12시간)은 "아침/저녁 둘 다 언제든 발행"이 되어 중복 발행/원치 않는 타이밍이 생길 수 있습니다.
+# 정상 운영은 10~20분 권장입니다. (필요하면 workflow에서 env로 관리하세요)
 SCHEDULE = [
     {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
     {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
@@ -163,34 +165,77 @@ def score_item(title: str, summary: str) -> int:
     for k, w in KEYWORD_WEIGHTS.items():
         if normalize_text(k) in text:
             score += w
-    # 숫자/공급/실적 느낌 가산
     if re.search(r"\b(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T)\b", text):
         score += 3
     return score
 
-# Google News RSS는 link가 news.google.com인 경우가 많아서 summary에서 "진짜 원문 링크"를 뽑습니다.
-def extract_original_url(item_link: str, summary_html: str) -> str:
-    # 1) summary에서 href 추출 (가장 흔함)
+# ---------------------------
+# Better dedupe: normalize title + simple similarity
+# ---------------------------
+def strip_media_suffix(title: str) -> str:
+    # [속보] 같은 머리 제거
+    t = (title or "").strip()
+    t = re.sub(r"^\[[^\]]+\]\s*", "", t)
+    # 끝의 " - 매체명" 제거(대부분의 구글뉴스 제목에 붙음)
+    t = re.sub(r"\s*-\s*[^-]+$", "", t)
+    # 따옴표/특수따옴표 제거
+    t = re.sub(r"[\"“”’‘]", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip().lower()
+
+def is_similar(a: str, b: str) -> bool:
+    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
+    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
+    if not sa or not sb:
+        return False
+    j = len(sa & sb) / len(sa | sb)
+    return j >= 0.85
+
+def extract_media_name(title: str) -> str:
+    # "... - 뉴데일리" -> "뉴데일리"
+    m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
+    return m.group(1).strip() if m else ""
+
+def _is_google_news_url(u: str) -> bool:
+    return "news.google.com" in (u or "")
+
+# Google News RSS는 link가 news.google.com인 경우가 많아서 "진짜 원문 링크"를 뽑습니다.
+def extract_original_url(entry, item_link: str, summary_html: str) -> str:
+    # 0) entry.links에서 외부 링크 우선
+    try:
+        for l in getattr(entry, "links", []) or []:
+            href = None
+            if isinstance(l, dict):
+                href = l.get("href")
+            else:
+                href = getattr(l, "href", None)
+            if href and href.startswith("http") and (not _is_google_news_url(href)):
+                return href
+    except Exception:
+        pass
+
+    # 1) summary에서 href 추출
     m = re.search(r'href="(https?://[^"]+)"', summary_html or "")
-    if m:
+    if m and (not _is_google_news_url(m.group(1))):
         return m.group(1)
 
     # 2) summary에 plain url이 있는 경우
     m2 = re.search(r'(https?://[^\s"<]+)', summary_html or "")
-    if m2:
+    if m2 and (not _is_google_news_url(m2.group(1))):
         return m2.group(1)
 
-    # 3) fallback: item link 자체
+    # 3) fallback: item link 자체 (이 경우 google 링크일 수 있음)
     return item_link
 
 def fetch_top_news(now_kst: datetime, top_k: int = 7) -> list[dict]:
     items = []
     seen = set()
+    norm_titles = []  # 유사도 중복 제거용
 
     for source_name, url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:50]:
+            for e in feed.entries[:80]:
                 title = getattr(e, "title", "") or ""
                 link = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
@@ -200,12 +245,20 @@ def fetch_top_news(now_kst: datetime, top_k: int = 7) -> list[dict]:
                 if not is_recent(e, now_kst, max_hours=48):
                     continue
 
+                # 1차: title+link 해시 중복
                 key = dedupe_key(title, link)
                 if key in seen:
                     continue
-                seen.add(key)
 
-                orig = extract_original_url(link, summary)
+                # 2차: 제목 정규화 유사도 중복(속보/따옴표/매체 꼬리 차이 제거)
+                norm = strip_media_suffix(title)
+                if any(is_similar(norm, nt) for nt in norm_titles):
+                    continue
+
+                seen.add(key)
+                norm_titles.append(norm)
+
+                orig = extract_original_url(e, link, summary)
                 s = score_item(title, summary)
 
                 items.append({
@@ -219,10 +272,8 @@ def fetch_top_news(now_kst: datetime, top_k: int = 7) -> list[dict]:
         except Exception as ex:
             print(f"[WARN] feed error: {source_name} - {ex}")
 
-    # 점수 정렬
     items.sort(key=lambda x: x["score"], reverse=True)
 
-    # 너무 약한 건 제외하되, 부족하면 채움
     filtered = [x for x in items if x["score"] >= 1]
     if len(filtered) < top_k:
         filtered = items[:top_k]
@@ -233,8 +284,8 @@ def fetch_top_news(now_kst: datetime, top_k: int = 7) -> list[dict]:
 # =========================
 def make_insight_block(items: list[dict]) -> str:
     """
-    items: [{"title":..., "domain":..., "orig_link":...}, ...]
-    Output (HTML):
+    items: [{"title":..., "media":..., "orig_link":...}, ...]
+    Output:
       ✅ 결론 1줄
       🔥 핵심 3줄
       📌 관전 포인트 1문장
@@ -245,9 +296,10 @@ def make_insight_block(items: list[dict]) -> str:
     lines = []
     for i, it in enumerate(items, 1):
         title = (it.get("title") or "").strip()
-        dom = (it.get("domain") or "").strip()
+        media = (it.get("media") or "").strip()
         link = (it.get("orig_link") or "").strip()
-        lines.append(f"{i}. [{dom}] {title} ({link})")
+        # 링크는 프롬프트에만 제공(출력에는 링크 넣지 말라고 지시)
+        lines.append(f"{i}. [{media or '매체미상'}] {title} ({link})")
 
     prompt = f"""
 너는 한국어로 '돈 되는 반도체 뉴스' 텔레그램 브리핑을 쓰는 에디터다.
@@ -256,7 +308,7 @@ def make_insight_block(items: list[dict]) -> str:
 - 아래 기사 목록만 근거로 사용한다. 목록에 없는 사실/숫자/날짜/기업관계는 만들지 않는다.
 - 단정 금지: "~이다/확정" 대신 "~로 보입니다/가능성이 있습니다" 톤.
 - 너무 전문용어 금지. 초보도 이해 가능한 말로 쓴다.
-- 출력은 아래 형식만(HTML 가능, 하지만 링크는 넣지 말고 텍스트만):
+- 출력은 아래 형식만(링크/URL 출력 금지).
 
 형식:
 ✅ 결론: (20~40자 1문장)
@@ -286,7 +338,6 @@ def make_insight_block(items: list[dict]) -> str:
 # Post builder
 # =========================
 def build_post(slot_name: str, now_kst: datetime) -> tuple[str, list[dict]]:
-    # 날짜 표기(리눅스/윈도우 호환)
     if os.name == "nt":
         date_str = now_kst.strftime("%m/%d").lstrip("0").replace("/0", "/")
     else:
@@ -295,14 +346,13 @@ def build_post(slot_name: str, now_kst: datetime) -> tuple[str, list[dict]]:
     header = f"<b>[Chip Signal | {slot_name}] {date_str} {'아침 브리핑' if slot_name=='AM' else '저녁 정리'}</b>"
     news = fetch_top_news(now_kst, top_k=TOP_K)
 
-    # 아이템 정규화
     items = []
     for it in news:
         link = (it.get("orig_link") or it.get("link") or "").strip()
-        dom = short_domain(link)
+        media = extract_media_name(it.get("title", ""))
         items.append({
             "title": it.get("title", ""),
-            "domain": dom,
+            "media": media,           # ✅ 도메인 대신 매체명
             "orig_link": link,
             "score": it.get("score", 0),
         })
@@ -312,12 +362,18 @@ def build_post(slot_name: str, now_kst: datetime) -> tuple[str, list[dict]]:
     lines = [header]
     if insight:
         lines.append(insight)
-        lines.append("")  # blank line
+        lines.append("")
 
     for i, it in enumerate(items, 1):
         t = clean_title(it["title"], max_len=82)
         lines.append(f"{i}) {t}")
-        lines.append(f"   - 출처: {it['domain']} | <a href=\"{it['orig_link']}\">원문</a>\n")
+
+        # ✅ '출처: news.google.com' 같은 표기 없앰
+        # 매체명이 있으면 매체명, 없으면 출처 줄 생략하고 원문만.
+        if it["media"]:
+            lines.append(f"   - 출처: {it['media']} | <a href=\"{it['orig_link']}\">원문</a>\n")
+        else:
+            lines.append(f"   - <a href=\"{it['orig_link']}\">원문</a>\n")
 
     lines.append("#반도체 #HBM #AI #파운드리 #장비 #패키징")
     text = "\n".join(lines)
@@ -331,7 +387,7 @@ def main():
     today = now_kst.strftime("%Y-%m-%d")
 
     state = load_state()
-    sent = state.get("sent", {})  # {"YYYY-MM-DD": {"AM": true, "PM": true}}
+    sent = state.get("sent", {})
 
     if today not in sent:
         sent[today] = {}
@@ -346,14 +402,13 @@ def main():
         if within_window(now_kst, slot["hour"], slot["minute"], slot["window_minutes"]) or FORCE_SEND:
             msg, items = build_post(name, now_kst)
 
-            # 아카이브 누적 저장(나중에 인사이트/리포트 만들기용)
             records = []
             for it in items:
                 records.append({
                     "ts": now_kst.isoformat(),
                     "slot": name,
                     "title": it["title"],
-                    "domain": it["domain"],
+                    "media": it["media"],
                     "link": it["orig_link"],
                     "score": it["score"],
                     "model": OPENAI_MODEL if OPENAI_API_KEY else None,
