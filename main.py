@@ -16,25 +16,20 @@ STATE_FILE = "state.json"
 ARCHIVE_FILE = "archive.jsonl"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # e.g., "@chipsignal"
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # e.g., "@chipsignal" or numeric chat id
 
 KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
-# 실시간 실행: 한 번 실행 때 몇 개 올릴지
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "2"))
-
-# 최근 몇 시간만 볼지
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "48"))
-
-# 강제 발행(디버그)
 FORCE_SEND = os.getenv("FORCE_SEND", "0") == "1"
 
-# 같은 토픽 연속 업로드 제한(사람 운영 느낌)
-BLOCK_SAME_TOPIC_STREAK = int(os.getenv("BLOCK_SAME_TOPIC_STREAK", "2"))  # 2면 2개 연속까지만 허용
+# 같은 토픽 연속 제한(사람 운영 느낌)
+BLOCK_SAME_TOPIC_STREAK = int(os.getenv("BLOCK_SAME_TOPIC_STREAK", "2"))  # 2개 연속까지만 허용
 
 # =========================
-# Sources (Google News RSS)
+# Google News RSS (KR)
 # =========================
 GN_BASE = "https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
 
@@ -55,38 +50,32 @@ def build_google_news_feeds():
 RSS_FEEDS = build_google_news_feeds()
 
 # =========================
-# Whitelist (권장: 국내 미디어 중심)
-# 비우면(=환경변수 미설정) 전체 허용
+# Domain whitelist (권장: 국내 미디어 중심)
+# 환경변수 DOMAIN_WHITELIST="" 로 비우면 전체 허용
 # =========================
 DEFAULT_WHITELIST = [
-    # 경제/종합
-    "hankyung.com", "mk.co.kr", "chosun.com", "joongang.co.kr", "donga.com",
-    "naver.com", "news.naver.com",
-    # IT/테크
-    "etnews.com", "zdnet.co.kr", "thelec.kr", "bloter.net", "it.chosun.com",
-    "news1.kr", "yonhapnews.co.kr",
-    # 방송/기타
-    "sbs.co.kr", "kbs.co.kr", "mbc.co.kr",
+    "hankyung.com", "mk.co.kr", "etnews.com", "zdnet.co.kr", "thelec.kr",
+    "bloter.net", "it.chosun.com", "yonhapnews.co.kr", "news1.kr",
+    "news.naver.com", "naver.com",
 ]
-WHITELIST = os.getenv("DOMAIN_WHITELIST", "").strip()
-DOMAIN_WHITELIST = [d.strip() for d in WHITELIST.split(",") if d.strip()] or DEFAULT_WHITELIST
+_whitelist_env = os.getenv("DOMAIN_WHITELIST", "").strip()
+DOMAIN_WHITELIST = [d.strip().lower() for d in _whitelist_env.split(",") if d.strip()]
+if _whitelist_env == "":
+    # "" 로 명시되면 완전 허용 모드
+    DOMAIN_WHITELIST = []
+elif not DOMAIN_WHITELIST:
+    DOMAIN_WHITELIST = DEFAULT_WHITELIST[:]  # 기본 적용
 
 # =========================
 # Scoring weights (money-ish)
 # =========================
 KEYWORD_WEIGHTS = {
-    # Memory/HBM
     "hbm": 12, "dram": 7, "ddr5": 5, "sk하이닉스": 8, "하이닉스": 7, "삼성전자": 6, "마이크론": 6,
-    # Foundry/process
     "tsmc": 10, "파운드리": 9, "2나노": 10, "3나노": 8, "gaa": 7, "gate-all-around": 7,
-    # Equip/EUV/packaging
     "asml": 10, "euv": 10, "노광": 8, "cowos": 9, "첨단패키징": 8, "칩렛": 7,
     "장비": 6, "소재": 5, "수율": 6,
-    # Policy/risk
     "수출규제": 9, "제재": 8, "규제": 6, "관세": 6, "중국": 6,
-    # Earnings/investment
     "실적": 9, "가이던스": 10, "전망": 7, "매출": 6, "capex": 9, "투자": 7, "증설": 7,
-    # AI demand
     "엔비디아": 8, "nvidia": 8, "ai": 6, "데이터센터": 7, "서버": 6, "gpu": 6,
 }
 
@@ -118,7 +107,7 @@ SEMICON_CORE = [
 ]
 
 # =========================
-# Utilities
+# IO helpers
 # =========================
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
@@ -126,7 +115,8 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as ex:
+        print("[WARN] state load failed:", ex)
         return {}
 
 def save_state(state: dict):
@@ -140,6 +130,9 @@ def append_archive(records: list[dict]):
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+# =========================
+# Text helpers
+# =========================
 def normalize_text(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
@@ -147,91 +140,6 @@ def normalize_text(s: str) -> str:
 
 def html_escape(s: str) -> str:
     return html.escape(s or "", quote=True)
-
-def short_domain(link: str) -> str:
-    try:
-        return urlparse(link).netloc.replace("www.", "")
-    except Exception:
-        return ""
-
-def send_message(text_html: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    with httpx.Client(timeout=25) as client_http:
-        r = client_http.post(url, json=payload)
-        print("Telegram status:", r.status_code)
-        print("Telegram response:", r.text[:300])
-        r.raise_for_status()
-
-def parse_entry_time(entry) -> datetime | None:
-    for key in ("published_parsed", "updated_parsed"):
-        t = getattr(entry, key, None)
-        if t:
-            try:
-                return datetime(*t[:6], tzinfo=UTC)
-            except Exception:
-                pass
-    return None
-
-def is_recent(entry, now_utc: datetime, max_hours: int) -> bool:
-    dt = parse_entry_time(entry)
-    if dt is None:
-        return True
-    return (now_utc - dt) <= timedelta(hours=max_hours)
-
-def _is_google_news_url(u: str) -> bool:
-    return "news.google.com" in (u or "")
-
-def extract_media_name(title: str) -> str:
-    m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
-    return m.group(1).strip() if m else ""
-
-def strip_media_suffix(title: str) -> str:
-    t = (title or "").strip()
-    t = re.sub(r"^\[[^\]]+\]\s*", "", t)
-    t = re.sub(r"\s*-\s*[^-]+$", "", t)
-    t = re.sub(r"[\"“”’‘]", "", t)
-    t = re.sub(r"\s+", " ", t)
-    return t.strip().lower()
-
-def is_similar(a: str, b: str) -> bool:
-    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
-    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
-    if not sa or not sb:
-        return False
-    j = len(sa & sb) / len(sa | sb)
-    return j >= 0.85
-
-def dedupe_key(title: str, orig_link: str) -> str:
-    base = strip_media_suffix(title) + "|" + (orig_link or "")
-    return hashlib.md5(base.encode("utf-8")).hexdigest()
-
-def extract_original_url(entry, item_link: str, summary_html: str) -> str:
-    try:
-        for l in getattr(entry, "links", []) or []:
-            href = l.get("href") if isinstance(l, dict) else getattr(l, "href", None)
-            if href and href.startswith("http") and (not _is_google_news_url(href)):
-                return href
-    except Exception:
-        pass
-
-    m = re.search(r'href="(https?://[^"]+)"', summary_html or "")
-    if m and (not _is_google_news_url(m.group(1))):
-        return m.group(1)
-
-    m2 = re.search(r'(https?://[^\s"<]+)', summary_html or "")
-    if m2 and (not _is_google_news_url(m2.group(1))):
-        return m2.group(1)
-
-    return item_link
 
 def strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s or "")
@@ -244,9 +152,85 @@ def split_sentences(s: str) -> list[str]:
     if not s:
         return []
     parts = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s+|(?<=다\?)\s+|(?<=다!)\s+", s)
-    parts = [p.strip() for p in parts if p and p.strip()]
-    return parts
+    return [p.strip() for p in parts if p and p.strip()]
 
+def extract_media_name(title: str) -> str:
+    m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
+    return m.group(1).strip() if m else ""
+
+def strip_media_suffix(title: str) -> str:
+    t = (title or "").strip()
+    t = re.sub(r"^\[[^\]]+\]\s*", "", t)         # [속보] 제거
+    t = re.sub(r"\s*-\s*[^-]+$", "", t)          # 끝의 "- 매체" 제거
+    t = re.sub(r"[\"“”’‘]", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip().lower()
+
+def is_similar(a: str, b: str) -> bool:
+    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
+    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
+    if not sa or not sb:
+        return False
+    j = len(sa & sb) / len(sa | sb)
+    return j >= 0.85
+
+def too_similar_to_title(title: str, sent: str) -> bool:
+    a = strip_media_suffix(title)
+    b = strip_media_suffix(sent)
+    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
+    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
+    if not sa or not sb:
+        return False
+    j = len(sa & sb) / len(sa | sb)
+    return j >= 0.80
+
+# =========================
+# Link helpers
+# =========================
+def short_domain(link: str) -> str:
+    try:
+        return urlparse(link).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+def _is_google_news_url(u: str) -> bool:
+    return "news.google.com" in (u or "")
+
+def domain_allowed(domain: str) -> bool:
+    if not DOMAIN_WHITELIST:
+        return True
+    d = (domain or "").lower()
+    return any(d == w or d.endswith("." + w) for w in DOMAIN_WHITELIST)
+
+def dedupe_key(title: str, orig_link: str) -> str:
+    base = strip_media_suffix(title) + "|" + (orig_link or "")
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
+
+def extract_original_url(entry, item_link: str, summary_html: str) -> str:
+    # entry.links에서 외부 링크 우선
+    try:
+        for l in getattr(entry, "links", []) or []:
+            href = l.get("href") if isinstance(l, dict) else getattr(l, "href", None)
+            if href and href.startswith("http") and (not _is_google_news_url(href)):
+                return href
+    except Exception:
+        pass
+
+    # summary에서 href 추출
+    m = re.search(r'href="(https?://[^"]+)"', summary_html or "")
+    if m and (not _is_google_news_url(m.group(1))):
+        return m.group(1)
+
+    # plain url
+    m2 = re.search(r'(https?://[^\s"<]+)', summary_html or "")
+    if m2 and (not _is_google_news_url(m2.group(1))):
+        return m2.group(1)
+
+    return item_link
+
+# =========================
+# Scoring / relevance
+# =========================
 def score_item(title: str, summary: str) -> int:
     text = normalize_text(f"{title} {summary}")
     score = 0
@@ -281,17 +265,7 @@ def sentence_score(sent: str) -> int:
         sc += 2
     return sc
 
-def too_similar_to_title(title: str, sent: str) -> bool:
-    a = strip_media_suffix(title)
-    b = strip_media_suffix(sent)
-    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
-    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
-    if not sa or not sb:
-        return False
-    j = len(sa & sb) / len(sa | sb)
-    return j >= 0.80
-
-def extract_summary_keywords(title: str, summary: str, top_n: int = 6) -> list[str]:
+def extract_summary_keywords(title: str, summary: str, top_n: int = 7) -> list[str]:
     text = normalize_text(f"{title} {strip_html(summary)}")
     hits = []
     for k, w in KEYWORD_WEIGHTS.items():
@@ -307,12 +281,54 @@ def extract_summary_keywords(title: str, summary: str, top_n: int = 6) -> list[s
             break
     return out
 
+def is_semiconductor_relevant(title: str, summary: str) -> bool:
+    text = normalize_text(f"{title} {strip_html(summary)}")
+    return any(normalize_text(k) in text for k in SEMICON_CORE)
+
+# =========================
+# Time / telegram
+# =========================
+def parse_entry_time(entry) -> datetime | None:
+    for key in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, key, None)
+        if t:
+            try:
+                return datetime(*t[:6], tzinfo=UTC)
+            except Exception:
+                pass
+    return None
+
+def is_recent(entry, now_utc: datetime, max_hours: int) -> bool:
+    dt = parse_entry_time(entry)
+    if dt is None:
+        return True
+    return (now_utc - dt) <= timedelta(hours=max_hours)
+
+def send_message(text_html: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    print(f"[DEBUG] Telegram send -> chat_id={CHAT_ID}")
+    with httpx.Client(timeout=25) as client_http:
+        r = client_http.post(url, json=payload)
+        print("[DEBUG] Telegram status:", r.status_code)
+        print("[DEBUG] Telegram response(head):", r.text[:400])
+        if r.status_code != 200:
+            print("[ERROR] Telegram error body:", r.text)
+        r.raise_for_status()
+
+# =========================
+# Summary / why builder (long + 강조)
+# =========================
 def build_long_summary(title: str, summary_html: str) -> tuple[list[str], list[str]]:
-    """
-    사람처럼 보이게: 문장 4~6개 + 포인트 1~2개
-    - 첫 문장은 “발췌” 느낌으로 따옴표 처리(가장 점수 높은 문장)
-    - 나머지는 요약 문장(기사에 있는 문장 편집)
-    """
     sents = split_sentences(summary_html)
     ranked = sorted(sents, key=sentence_score, reverse=True)
 
@@ -325,7 +341,7 @@ def build_long_summary(title: str, summary_html: str) -> tuple[list[str], list[s
             s = s[:107] + "..."
         if s and s not in picked:
             picked.append(s)
-        if len(picked) >= 6:  # ✅ 길게
+        if len(picked) >= 6:
             break
 
     bullets = []
@@ -366,67 +382,48 @@ def build_why_long(topic: str, title: str, summary: str) -> str:
         return f"{base} {extra}"
     return base
 
-def is_semiconductor_relevant(title: str, summary: str) -> bool:
-    text = normalize_text(f"{title} {strip_html(summary)}")
-    return any(normalize_text(k) in text for k in SEMICON_CORE)
-
-def domain_allowed(domain: str) -> bool:
-    if not DOMAIN_WHITELIST:
-        return True
-    d = (domain or "").lower()
-    return any(d == w or d.endswith("." + w) for w in DOMAIN_WHITELIST)
-
 def make_one_line_conclusion(topic: str, title: str) -> str:
     core = strip_html(title)
     core = re.sub(r"\s+", " ", core).strip()
     core = re.sub(r"\s*-\s*[^-]+$", "", core).strip()
     if len(core) > 58:
         core = core[:55] + "..."
-    # 사람 말투
     return f"오늘은 <b>{html_escape(topic)}</b> 쪽이 다시 힘을 받는 흐름입니다 — <b>{html_escape(core)}</b>"
 
 # =========================
-# Message Builder (사람 편집 느낌)
+# Message builder
 # =========================
 def build_feed_message(item: dict) -> tuple[str, str]:
     title = item.get("title", "")
     summary = item.get("summary", "")
-    media = item.get("media", "") or short_domain(item.get("orig_link", ""))
     link = item.get("orig_link", "")
+    media = item.get("media", "") or short_domain(link)
     published_kst = item.get("published_kst", None)
 
     topic = detect_top_topic(title, summary)
     conclusion = make_one_line_conclusion(topic, title)
 
-    # 길게 요약
     sents, bullets = build_long_summary(title, summary)
-
-    # 첫 문장은 따옴표 발췌(정보량 높은 문장)
-    lines = []
-    if sents:
-        first = sents[0]
-        lines.append(f"• “<b>{html_escape(first)}</b>”")
-        for s in sents[1:]:
-            lines.append(f"• {html_escape(s)}")
-
-    # 하이라이트(코드 박스 느낌)
-    if bullets:
-        for b in bullets:
-            lines.append(f"• <code>{html_escape(b)}</code>")
-
     why = build_why_long(topic, title, summary)
 
-    # 시간 표시
     time_line = ""
     if isinstance(published_kst, datetime):
         time_line = published_kst.strftime("%m/%d %H:%M")
         time_line = f"<i>{html_escape(time_line)} (KST)</i>"
 
+    lines = []
+    if sents:
+        lines.append(f"• “<b>{html_escape(sents[0])}</b>”")
+        for s in sents[1:]:
+            lines.append(f"• {html_escape(s)}")
+    if bullets:
+        for b in bullets:
+            lines.append(f"• <code>{html_escape(b)}</code>")
+
     msg = []
-    msg.append(f"<b>[Chip Signal] 업데이트</b>")
+    msg.append("<b>[Chip Signal] 업데이트</b>")
     if time_line:
         msg.append(time_line)
-
     msg.append(f"🧩 <b>한 줄 결론</b>: {conclusion}")
     msg.append("📌 <b>핵심 요약</b>:")
     msg.extend(lines if lines else ["• <code>요약 데이터가 부족해 키워드 중심으로 정리합니다.</code>"])
@@ -440,38 +437,55 @@ def build_feed_message(item: dict) -> tuple[str, str]:
 # =========================
 # Fetch candidates
 # =========================
-def fetch_candidates(now_utc: datetime) -> list[dict]:
+def fetch_candidates(now_utc: datetime) -> tuple[list[dict], dict]:
     items = []
     seen_norm_titles = []
+
+    stats = {
+        "total_entries": 0,
+        "skip_not_recent": 0,
+        "skip_not_relevant": 0,
+        "skip_domain": 0,
+        "skip_similar_title": 0,
+        "kept": 0,
+    }
 
     for source_name, url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:140]:
+            for e in feed.entries[:160]:
+                stats["total_entries"] += 1
+
                 title = getattr(e, "title", "") or ""
                 link = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
 
                 if not title or not link:
                     continue
+
                 if not is_recent(e, now_utc, max_hours=LOOKBACK_HOURS):
+                    stats["skip_not_recent"] += 1
                     continue
+
                 if not is_semiconductor_relevant(title, summary):
+                    stats["skip_not_relevant"] += 1
                     continue
 
                 orig = extract_original_url(e, link, summary)
                 dom = short_domain(orig)
+
                 if not domain_allowed(dom):
+                    stats["skip_domain"] += 1
                     continue
 
                 norm = strip_media_suffix(title)
                 if any(is_similar(norm, nt) for nt in seen_norm_titles):
+                    stats["skip_similar_title"] += 1
                     continue
                 seen_norm_titles.append(norm)
 
-                sc = score_item(title, summary)
                 media = extract_media_name(title)
-
+                sc = score_item(title, summary)
                 dt_utc = parse_entry_time(e)
                 dt_kst = dt_utc.astimezone(KST) if dt_utc else None
 
@@ -485,40 +499,49 @@ def fetch_candidates(now_utc: datetime) -> list[dict]:
                     "published_utc": dt_utc,
                     "published_kst": dt_kst,
                 })
+                stats["kept"] += 1
+
         except Exception as ex:
             print(f"[WARN] feed error: {source_name} - {ex}")
 
-    # 최신성 우선 + 점수 보조
     def sort_key(x):
         ts = x["published_utc"].timestamp() if x["published_utc"] else 0
         return (ts, x["score"])
 
     items.sort(key=sort_key, reverse=True)
-    return items
+    return items, stats
 
 # =========================
 # Main
 # =========================
 def main():
-    now_utc = datetime.now(tz=UTC)
-    state = load_state()
+    print("========== Chip Signal Runner ==========")
+    print("[DEBUG] Now UTC:", datetime.now(tz=UTC).isoformat())
+    print("[DEBUG] FORCE_SEND:", FORCE_SEND)
+    print("[DEBUG] LOOKBACK_HOURS:", LOOKBACK_HOURS)
+    print("[DEBUG] MAX_POSTS_PER_RUN:", MAX_POSTS_PER_RUN)
+    print("[DEBUG] DOMAIN_WHITELIST:", DOMAIN_WHITELIST if DOMAIN_WHITELIST else "(ALLOW ALL)")
+    print("[DEBUG] CHAT_ID:", CHAT_ID)
 
+    state = load_state()
     posted = state.get("posted", {})
     if not isinstance(posted, dict):
         posted = {}
 
-    # 토픽 연속 제한용
     last_topics = state.get("last_topics", [])
     if not isinstance(last_topics, list):
         last_topics = []
 
-    candidates = fetch_candidates(now_utc)
+    now_utc = datetime.now(tz=UTC)
+    candidates, stats = fetch_candidates(now_utc)
 
-    to_post = []
+    print("[DEBUG] Feed stats:", stats)
+    print("[DEBUG] posted keys:", len(posted))
+    print("[DEBUG] candidates:", len(candidates))
+
+    # streak 계산
     streak_topic = None
     streak_count = 0
-
-    # 현재 last_topics 기준으로 streak 계산
     if last_topics:
         streak_topic = last_topics[-1]
         streak_count = 1
@@ -528,19 +551,24 @@ def main():
             else:
                 break
 
+    to_post = []
+    skip_already_posted = 0
+    skip_topic_streak = 0
+
     for it in candidates:
         key = dedupe_key(it["title"], it["orig_link"])
         if (not FORCE_SEND) and (key in posted):
+            skip_already_posted += 1
             continue
 
         msg, topic = build_feed_message(it)
 
-        # 같은 토픽 연속 제한
         if (not FORCE_SEND) and streak_topic == topic and streak_count >= BLOCK_SAME_TOPIC_STREAK:
+            skip_topic_streak += 1
             continue
 
         to_post.append((key, it, msg, topic))
-        # streak 업데이트(루프 내부용)
+
         if streak_topic == topic:
             streak_count += 1
         else:
@@ -550,17 +578,23 @@ def main():
         if len(to_post) >= MAX_POSTS_PER_RUN:
             break
 
+    print("[DEBUG] skip_already_posted:", skip_already_posted)
+    print("[DEBUG] skip_topic_streak:", skip_topic_streak)
+    print("[DEBUG] to_post:", len(to_post))
+
     if not to_post:
         print("No new items to post.")
         return
 
     archive_rows = []
     for key, it, msg, topic in to_post:
+        print("[DEBUG] Will send:", it["title"])
+        print("[DEBUG] Link:", it["orig_link"])
         send_message(msg)
-        posted[key] = now_utc.isoformat()
 
+        posted[key] = now_utc.isoformat()
         last_topics.append(topic)
-        last_topics = last_topics[-20:]  # 최근 20개만 보관
+        last_topics = last_topics[-20:]
 
         archive_rows.append({
             "ts": now_utc.astimezone(KST).isoformat(),
@@ -569,7 +603,7 @@ def main():
             "link": it["orig_link"],
             "score": it["score"],
             "topic": topic,
-            "mode": "no_api_feed_human_format_long",
+            "mode": "debug_human_format_long",
         })
 
     state["posted"] = posted
