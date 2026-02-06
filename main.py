@@ -5,8 +5,8 @@ import httpx
 
 STATE_FILE = "state.json"
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # 예: "@chipsignal"
+BOT_TOKEN = os.getenv("8144069359:AAF2xDaARq6KDKCW0wySRWQQAZ717C4sejc", "")
+CHAT_ID = os.getenv("@chipsignal", "")  # 예: "@chipsignal"
 
 KST = timezone(timedelta(hours=9))
 
