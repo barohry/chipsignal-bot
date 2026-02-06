@@ -11,8 +11,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 KST = timezone(timedelta(hours=9))
 
 SCHEDULE = [
-    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
-    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
+    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 10},
+    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 10},
 ]
 
 def load_state():
