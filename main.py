@@ -17,8 +17,8 @@ KST = timezone(timedelta(hours=9))
 
 # 발행 시간(한국시간)과 허용 윈도우(분)
 SCHEDULE = [
-    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 10},
-    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 10},
+    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
+    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
 ]
 
 # === RSS 소스 (MVP: 안정적인 무료 소스 위주) ===
