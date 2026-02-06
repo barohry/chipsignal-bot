@@ -21,18 +21,21 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # e.g., "@chipsignal"
 KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
-# 한 번 실행될 때 새 기사 몇 개까지 올릴지
+# 실시간 실행: 한 번 실행 때 몇 개 올릴지
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "2"))
 
-# 최근 몇 시간 기사만 대상으로 할지 (너무 넓으면 중복/노이즈 증가)
+# 최근 몇 시간만 볼지
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "48"))
 
-# 강제 발행(디버그): 1이면 이미 올린 기사라도 상위 n개를 그냥 보냄(테스트용)
+# 강제 발행(디버그)
 FORCE_SEND = os.getenv("FORCE_SEND", "0") == "1"
 
-# ---------------------------
-# Google News RSS (KR)
-# ---------------------------
+# 같은 토픽 연속 업로드 제한(사람 운영 느낌)
+BLOCK_SAME_TOPIC_STREAK = int(os.getenv("BLOCK_SAME_TOPIC_STREAK", "2"))  # 2면 2개 연속까지만 허용
+
+# =========================
+# Sources (Google News RSS)
+# =========================
 GN_BASE = "https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
 
 GOOGLE_NEWS_QUERIES = [
@@ -51,9 +54,26 @@ def build_google_news_feeds():
 
 RSS_FEEDS = build_google_news_feeds()
 
-# ---------------------------
-# Money-ish keyword weights
-# ---------------------------
+# =========================
+# Whitelist (권장: 국내 미디어 중심)
+# 비우면(=환경변수 미설정) 전체 허용
+# =========================
+DEFAULT_WHITELIST = [
+    # 경제/종합
+    "hankyung.com", "mk.co.kr", "chosun.com", "joongang.co.kr", "donga.com",
+    "naver.com", "news.naver.com",
+    # IT/테크
+    "etnews.com", "zdnet.co.kr", "thelec.kr", "bloter.net", "it.chosun.com",
+    "news1.kr", "yonhapnews.co.kr",
+    # 방송/기타
+    "sbs.co.kr", "kbs.co.kr", "mbc.co.kr",
+]
+WHITELIST = os.getenv("DOMAIN_WHITELIST", "").strip()
+DOMAIN_WHITELIST = [d.strip() for d in WHITELIST.split(",") if d.strip()] or DEFAULT_WHITELIST
+
+# =========================
+# Scoring weights (money-ish)
+# =========================
 KEYWORD_WEIGHTS = {
     # Memory/HBM
     "hbm": 12, "dram": 7, "ddr5": 5, "sk하이닉스": 8, "하이닉스": 7, "삼성전자": 6, "마이크론": 6,
@@ -81,14 +101,21 @@ TOPIC_BUCKETS = [
 ]
 
 WHY_IMPORTANT_TEMPLATES = {
-    "HBM/메모리": "AI 수요(서버/GPU)와 직결되는 메모리 공급·가격 기대가 같이 움직이는 구간입니다.",
-    "파운드리/공정": "공정 경쟁은 고객사 수주·CAPEX·수율 이슈로 바로 이어질 수 있어 흐름 체크가 중요합니다.",
+    "HBM/메모리": "요즘 시장은 AI 수요를 ‘메모리 공급·가격’으로 바로 번역하는 구간입니다.",
+    "파운드리/공정": "공정 경쟁은 수주·CAPEX·수율 이슈로 연결돼, 뒤늦게 따라붙는 기사들이 많습니다.",
     "장비/EUV": "장비/노광은 증설 속도와 수율을 좌우해서 ‘실제 공급 능력’의 선행지표로 읽히는 편입니다.",
-    "패키징/CoWoS": "패키징 병목은 출하량(=실적)과 연결되는 경우가 많아 단기 모멘텀으로 자주 언급됩니다.",
-    "정책/리스크": "규제/제재는 공급망 재편과 비용 증가로 이어질 수 있어 변동성 요인으로 작동합니다.",
-    "AI 수요": "AI 서버 투자와 연결되어 관련 기업의 가이던스/수주 기대가 같이 부각되기 쉽습니다.",
-    "실적/투자": "실적·가이던스·투자는 시장 기대치가 바뀌는 지점이라 반응이 빠르게 나오는 편입니다.",
+    "패키징/CoWoS": "패키징 병목은 출하량(=실적)과 연결되는 경우가 많아 단기 모멘텀이 자주 붙습니다.",
+    "정책/리스크": "규제/제재는 공급망 재편과 비용 증가로 이어져 변동성 요인으로 작동합니다.",
+    "AI 수요": "AI 서버 투자와 연결되어, 관련 섹터로 모멘텀이 번지는 속도가 빠릅니다.",
+    "실적/투자": "실적·가이던스·투자는 시장 기대치가 바뀌는 지점이라 반응이 즉각적으로 나오는 편입니다.",
 }
+
+SEMICON_CORE = [
+    "반도체", "hbm", "dram", "ddr", "낸드", "nand",
+    "파운드리", "tsmc", "asml", "euv", "노광",
+    "2나노", "3나노", "칩렛", "cowos", "패키징",
+    "gpu", "엔비디아", "nvidia", "데이터센터", "서버"
+]
 
 # =========================
 # Utilities
@@ -118,14 +145,14 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+def html_escape(s: str) -> str:
+    return html.escape(s or "", quote=True)
+
 def short_domain(link: str) -> str:
     try:
         return urlparse(link).netloc.replace("www.", "")
     except Exception:
         return ""
-
-def html_escape(s: str) -> str:
-    return html.escape(s or "", quote=True)
 
 def send_message(text_html: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -145,7 +172,6 @@ def send_message(text_html: str):
         r.raise_for_status()
 
 def parse_entry_time(entry) -> datetime | None:
-    # feedparser는 published_parsed / updated_parsed가 있으면 time.struct_time
     for key in ("published_parsed", "updated_parsed"):
         t = getattr(entry, key, None)
         if t:
@@ -165,12 +191,10 @@ def _is_google_news_url(u: str) -> bool:
     return "news.google.com" in (u or "")
 
 def extract_media_name(title: str) -> str:
-    # "... - 뉴데일리" 형태면 매체명만 뽑음
     m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
     return m.group(1).strip() if m else ""
 
 def strip_media_suffix(title: str) -> str:
-    # 중복 제거용: [속보] + 끝의 "- 매체명" 제거 등
     t = (title or "").strip()
     t = re.sub(r"^\[[^\]]+\]\s*", "", t)
     t = re.sub(r"\s*-\s*[^-]+$", "", t)
@@ -191,7 +215,6 @@ def dedupe_key(title: str, orig_link: str) -> str:
     return hashlib.md5(base.encode("utf-8")).hexdigest()
 
 def extract_original_url(entry, item_link: str, summary_html: str) -> str:
-    # 0) entry.links에서 외부 링크 우선
     try:
         for l in getattr(entry, "links", []) or []:
             href = l.get("href") if isinstance(l, dict) else getattr(l, "href", None)
@@ -200,44 +223,16 @@ def extract_original_url(entry, item_link: str, summary_html: str) -> str:
     except Exception:
         pass
 
-    # 1) summary href
     m = re.search(r'href="(https?://[^"]+)"', summary_html or "")
     if m and (not _is_google_news_url(m.group(1))):
         return m.group(1)
 
-    # 2) plain url
     m2 = re.search(r'(https?://[^\s"<]+)', summary_html or "")
     if m2 and (not _is_google_news_url(m2.group(1))):
         return m2.group(1)
 
-    # 3) fallback
     return item_link
 
-def score_item(title: str, summary: str) -> int:
-    text = normalize_text(f"{title} {summary}")
-    score = 0
-    for k, w in KEYWORD_WEIGHTS.items():
-        if normalize_text(k) in text:
-            score += w
-    if re.search(r"\b(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T)\b", text):
-        score += 3
-    return score
-
-def detect_top_topic(title: str, summary: str) -> str:
-    text = normalize_text(f"{title} {summary}")
-    best = ("핵심 이슈", 0)
-    for name, keys in TOPIC_BUCKETS:
-        c = 0
-        for k in keys:
-            if normalize_text(k) in text:
-                c += 1
-        if c > best[1]:
-            best = (name, c)
-    return best[0]
-
-# =========================
-# Human-like summary builder (NO API)
-# =========================
 def strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s or "")
     s = html.unescape(s)
@@ -248,57 +243,152 @@ def split_sentences(s: str) -> list[str]:
     s = strip_html(s)
     if not s:
         return []
-    # 한국어/영문 혼합 문장 분리
     parts = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s+|(?<=다\?)\s+|(?<=다!)\s+", s)
     parts = [p.strip() for p in parts if p and p.strip()]
     return parts
 
+def score_item(title: str, summary: str) -> int:
+    text = normalize_text(f"{title} {summary}")
+    score = 0
+    for k, w in KEYWORD_WEIGHTS.items():
+        if normalize_text(k) in text:
+            score += w
+    if re.search(r"\b(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T|배|원|달러)\b", text):
+        score += 3
+    return score
+
+def detect_top_topic(title: str, summary: str) -> str:
+    text = normalize_text(f"{title} {summary}")
+    best = ("반도체 시장", 0)
+    for name, keys in TOPIC_BUCKETS:
+        c = 0
+        for k in keys:
+            if normalize_text(k) in text:
+                c += 1
+        if c > best[1]:
+            best = (name, c)
+    return best[0]
+
 def sentence_score(sent: str) -> int:
     t = normalize_text(sent)
     sc = 0
-    # 숫자/단위/퍼센트가 있으면 정보량 가산
-    if re.search(r"(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T|배|원|달러)", sent):
+    if re.search(r"(\d+(\.\d+)?)(nm|%|조|억|만|배|원|달러|B|M|T)", sent):
         sc += 4
-    # 돈 되는 키워드 가산
     for k, w in KEYWORD_WEIGHTS.items():
         if normalize_text(k) in t:
-            sc += min(3, w // 4)  # 과도한 점수 폭주 방지
-    # 행동 단어(투자/증설/가이던스 등)
+            sc += min(3, w // 4)
     if re.search(r"(투자|증설|가이던스|실적|수주|양산|출하|규제|제재|관세|수율|공급|부족|급등|하락)", sent):
         sc += 2
     return sc
 
-def pick_best_sentences(summary_html: str, k: int = 2, max_chars: int = 70) -> list[str]:
-    sents = split_sentences(summary_html)
-    if not sents:
-        return []
+def too_similar_to_title(title: str, sent: str) -> bool:
+    a = strip_media_suffix(title)
+    b = strip_media_suffix(sent)
+    sa = set(re.findall(r"[0-9a-zA-Z가-힣]+", a))
+    sb = set(re.findall(r"[0-9a-zA-Z가-힣]+", b))
+    if not sa or not sb:
+        return False
+    j = len(sa & sb) / len(sa | sb)
+    return j >= 0.80
 
+def extract_summary_keywords(title: str, summary: str, top_n: int = 6) -> list[str]:
+    text = normalize_text(f"{title} {strip_html(summary)}")
+    hits = []
+    for k, w in KEYWORD_WEIGHTS.items():
+        if normalize_text(k) in text:
+            hits.append((k, w))
+    hits.sort(key=lambda x: x[1], reverse=True)
+    out = []
+    for k, _ in hits:
+        kk = k.upper() if k.isalpha() else k
+        if kk not in out:
+            out.append(kk)
+        if len(out) >= top_n:
+            break
+    return out
+
+def build_long_summary(title: str, summary_html: str) -> tuple[list[str], list[str]]:
+    """
+    사람처럼 보이게: 문장 4~6개 + 포인트 1~2개
+    - 첫 문장은 “발췌” 느낌으로 따옴표 처리(가장 점수 높은 문장)
+    - 나머지는 요약 문장(기사에 있는 문장 편집)
+    """
+    sents = split_sentences(summary_html)
     ranked = sorted(sents, key=sentence_score, reverse=True)
+
     picked = []
     for s in ranked:
+        if too_similar_to_title(title, s):
+            continue
         s = re.sub(r"\s+", " ", s).strip()
-        if len(s) > max_chars:
-            s = s[: max_chars - 3] + "..."
+        if len(s) > 110:
+            s = s[:107] + "..."
         if s and s not in picked:
             picked.append(s)
-        if len(picked) >= k:
+        if len(picked) >= 6:  # ✅ 길게
             break
-    return picked
 
-def make_one_line_summary(title: str, topic: str) -> str:
-    # 단정 피하고 “~로 보입니다/~쪽이 부각됩니다” 톤
-    core = strip_media_suffix(title)
+    bullets = []
+    kws = extract_summary_keywords(title, summary_html, top_n=7)
+    if kws:
+        bullets.append("키워드: " + " · ".join(kws[:7]))
+
+    clean = strip_html(summary_html)
+    nums = re.findall(r"(\d+(?:\.\d+)?\s*(?:nm|%|조|억|만|배|원|달러|B|M|T))", clean)
+    nums = list(dict.fromkeys(nums))
+    if nums:
+        bullets.append("수치: " + ", ".join(nums[:5]))
+
+    return picked[:6], bullets[:2]
+
+def build_why_long(topic: str, title: str, summary: str) -> str:
+    base = WHY_IMPORTANT_TEMPLATES.get(
+        topic,
+        "관련 기사들이 같은 방향으로 묶이는지 흐름을 체크해보시는 게 좋겠습니다."
+    )
+
+    text = normalize_text(f"{title} {strip_html(summary)}")
+    impact = []
+
+    if any(k in text for k in ["실적", "가이던스", "전망", "매출"]):
+        impact.append("실적/가이던스는 기대치가 바뀌는 지점이라, 단기 가격 반응이 커질 수 있습니다.")
+    if any(k in text for k in ["투자", "capex", "증설", "양산"]):
+        impact.append("투자·증설은 공급 능력과 직결돼, 중장기 사이클 판단에 도움이 됩니다.")
+    if any(k in text for k in ["규제", "제재", "수출규제", "관세"]):
+        impact.append("규제 이슈는 공급망 재편·비용 증가로 이어져, 변동성 요인이 될 수 있습니다.")
+    if any(k in text for k in ["수율", "노광", "euv", "asml", "장비"]):
+        impact.append("장비·수율은 ‘실제 출하 가능 물량’에 영향을 줘, 모멘텀의 근거가 되기 쉽습니다.")
+    if any(k in text for k in ["엔비디아", "nvidia", "서버", "데이터센터", "gpu", "ai"]):
+        impact.append("AI 수요는 메모리/패키징 병목과 이어지며, 관련 섹터로 번지는 속도가 빠릅니다.")
+
+    extra = " ".join(impact[:2]).strip()
+    if extra:
+        return f"{base} {extra}"
+    return base
+
+def is_semiconductor_relevant(title: str, summary: str) -> bool:
+    text = normalize_text(f"{title} {strip_html(summary)}")
+    return any(normalize_text(k) in text for k in SEMICON_CORE)
+
+def domain_allowed(domain: str) -> bool:
+    if not DOMAIN_WHITELIST:
+        return True
+    d = (domain or "").lower()
+    return any(d == w or d.endswith("." + w) for w in DOMAIN_WHITELIST)
+
+def make_one_line_conclusion(topic: str, title: str) -> str:
+    core = strip_html(title)
     core = re.sub(r"\s+", " ", core).strip()
-    if len(core) > 42:
-        core = core[:39] + "..."
-    # 사람같은 문장 템플릿
-    return f"{topic} 이슈가 다시 부각됩니다: {core}"
+    core = re.sub(r"\s*-\s*[^-]+$", "", core).strip()
+    if len(core) > 58:
+        core = core[:55] + "..."
+    # 사람 말투
+    return f"오늘은 <b>{html_escape(topic)}</b> 쪽이 다시 힘을 받는 흐름입니다 — <b>{html_escape(core)}</b>"
 
-def build_feed_message(item: dict) -> str:
-    """
-    item: {title, summary, media, orig_link, score, published_kst}
-    텔레그램 HTML 메시지로 구성
-    """
+# =========================
+# Message Builder (사람 편집 느낌)
+# =========================
+def build_feed_message(item: dict) -> tuple[str, str]:
     title = item.get("title", "")
     summary = item.get("summary", "")
     media = item.get("media", "") or short_domain(item.get("orig_link", ""))
@@ -306,43 +396,49 @@ def build_feed_message(item: dict) -> str:
     published_kst = item.get("published_kst", None)
 
     topic = detect_top_topic(title, summary)
-    why = WHY_IMPORTANT_TEMPLATES.get(topic, "관련 기사들이 같은 방향으로 묶이는지 흐름을 체크해보시는 게 좋겠습니다.")
-    one_line = make_one_line_summary(title, topic)
+    conclusion = make_one_line_conclusion(topic, title)
 
-    # summary 발췌 2문장(인용 느낌)
-    picks = pick_best_sentences(summary, k=2, max_chars=78)
-    quote_lines = []
-    for p in picks:
-        quote_lines.append(f"• “{html_escape(p)}”")
+    # 길게 요약
+    sents, bullets = build_long_summary(title, summary)
 
-    # 시간 표기(선택)
+    # 첫 문장은 따옴표 발췌(정보량 높은 문장)
+    lines = []
+    if sents:
+        first = sents[0]
+        lines.append(f"• “<b>{html_escape(first)}</b>”")
+        for s in sents[1:]:
+            lines.append(f"• {html_escape(s)}")
+
+    # 하이라이트(코드 박스 느낌)
+    if bullets:
+        for b in bullets:
+            lines.append(f"• <code>{html_escape(b)}</code>")
+
+    why = build_why_long(topic, title, summary)
+
+    # 시간 표시
     time_line = ""
     if isinstance(published_kst, datetime):
         time_line = published_kst.strftime("%m/%d %H:%M")
-        time_line = f"<i>{html_escape(time_line)} (KST)</i>\n"
+        time_line = f"<i>{html_escape(time_line)} (KST)</i>"
 
-    # 메시지 구성: 링크는 맨 마지막
     msg = []
     msg.append(f"<b>[Chip Signal] 업데이트</b>")
     if time_line:
-        msg.append(time_line.strip())
-    msg.append(f"🧩 <b>한 줄 요약</b>: {html_escape(one_line)}")
-    if quote_lines:
-        msg.append("📌 <b>기사 요약(발췌)</b>:")
-        msg.extend(quote_lines)
+        msg.append(time_line)
+
+    msg.append(f"🧩 <b>한 줄 결론</b>: {conclusion}")
+    msg.append("📌 <b>핵심 요약</b>:")
+    msg.extend(lines if lines else ["• <code>요약 데이터가 부족해 키워드 중심으로 정리합니다.</code>"])
     msg.append(f"💡 <b>왜 중요?</b> {html_escape(why)}")
-
-    if media:
-        msg.append(f"📰 <b>출처</b>: {html_escape(media)}")
-
-    # 링크는 마지막 “첨부” 느낌
+    msg.append(f"📰 <b>출처</b>: {html_escape(media)}")
     msg.append(f"🔗 <b>원문</b>: <a href=\"{html_escape(link)}\">기사 보기</a>")
-
     msg.append("\n#반도체 #HBM #AI #파운드리 #장비 #패키징")
-    return "\n".join(msg)
+
+    return "\n".join(msg), topic
 
 # =========================
-# Fetch & post
+# Fetch candidates
 # =========================
 def fetch_candidates(now_utc: datetime) -> list[dict]:
     items = []
@@ -351,7 +447,7 @@ def fetch_candidates(now_utc: datetime) -> list[dict]:
     for source_name, url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:100]:
+            for e in feed.entries[:140]:
                 title = getattr(e, "title", "") or ""
                 link = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
@@ -360,13 +456,19 @@ def fetch_candidates(now_utc: datetime) -> list[dict]:
                     continue
                 if not is_recent(e, now_utc, max_hours=LOOKBACK_HOURS):
                     continue
+                if not is_semiconductor_relevant(title, summary):
+                    continue
+
+                orig = extract_original_url(e, link, summary)
+                dom = short_domain(orig)
+                if not domain_allowed(dom):
+                    continue
 
                 norm = strip_media_suffix(title)
                 if any(is_similar(norm, nt) for nt in seen_norm_titles):
                     continue
                 seen_norm_titles.append(norm)
 
-                orig = extract_original_url(e, link, summary)
                 sc = score_item(title, summary)
                 media = extract_media_name(title)
 
@@ -386,7 +488,7 @@ def fetch_candidates(now_utc: datetime) -> list[dict]:
         except Exception as ex:
             print(f"[WARN] feed error: {source_name} - {ex}")
 
-    # “실시간 피드”는 최신성도 중요하니 published 우선 + 점수 보조
+    # 최신성 우선 + 점수 보조
     def sort_key(x):
         ts = x["published_utc"].timestamp() if x["published_utc"] else 0
         return (ts, x["score"])
@@ -394,25 +496,57 @@ def fetch_candidates(now_utc: datetime) -> list[dict]:
     items.sort(key=sort_key, reverse=True)
     return items
 
+# =========================
+# Main
+# =========================
 def main():
     now_utc = datetime.now(tz=UTC)
     state = load_state()
 
-    posted = state.get("posted", {})  # {dedupe_key: iso_ts}
+    posted = state.get("posted", {})
     if not isinstance(posted, dict):
         posted = {}
+
+    # 토픽 연속 제한용
+    last_topics = state.get("last_topics", [])
+    if not isinstance(last_topics, list):
+        last_topics = []
 
     candidates = fetch_candidates(now_utc)
 
     to_post = []
+    streak_topic = None
+    streak_count = 0
+
+    # 현재 last_topics 기준으로 streak 계산
+    if last_topics:
+        streak_topic = last_topics[-1]
+        streak_count = 1
+        for i in range(len(last_topics) - 2, -1, -1):
+            if last_topics[i] == streak_topic:
+                streak_count += 1
+            else:
+                break
+
     for it in candidates:
         key = dedupe_key(it["title"], it["orig_link"])
-        if FORCE_SEND:
-            to_post.append((key, it))
+        if (not FORCE_SEND) and (key in posted):
+            continue
+
+        msg, topic = build_feed_message(it)
+
+        # 같은 토픽 연속 제한
+        if (not FORCE_SEND) and streak_topic == topic and streak_count >= BLOCK_SAME_TOPIC_STREAK:
+            continue
+
+        to_post.append((key, it, msg, topic))
+        # streak 업데이트(루프 내부용)
+        if streak_topic == topic:
+            streak_count += 1
         else:
-            if key in posted:
-                continue
-            to_post.append((key, it))
+            streak_topic = topic
+            streak_count = 1
+
         if len(to_post) >= MAX_POSTS_PER_RUN:
             break
 
@@ -421,11 +555,12 @@ def main():
         return
 
     archive_rows = []
-    for key, it in to_post:
-        msg = build_feed_message(it)
+    for key, it, msg, topic in to_post:
         send_message(msg)
-
         posted[key] = now_utc.isoformat()
+
+        last_topics.append(topic)
+        last_topics = last_topics[-20:]  # 최근 20개만 보관
 
         archive_rows.append({
             "ts": now_utc.astimezone(KST).isoformat(),
@@ -433,12 +568,15 @@ def main():
             "media": it["media"] or short_domain(it["orig_link"]),
             "link": it["orig_link"],
             "score": it["score"],
-            "mode": "no_api_feed",
+            "topic": topic,
+            "mode": "no_api_feed_human_format_long",
         })
 
     state["posted"] = posted
+    state["last_topics"] = last_topics
     save_state(state)
     append_archive(archive_rows)
+
     print(f"Posted {len(to_post)} item(s).")
 
 if __name__ == "__main__":
