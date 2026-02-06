@@ -2,12 +2,12 @@ import os
 import re
 import json
 import hashlib
+import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 
 import httpx
 import feedparser
-from openai import OpenAI
 
 # =========================
 # Config
@@ -18,25 +18,17 @@ ARCHIVE_FILE = "archive.jsonl"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # e.g., "@chipsignal"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # 기본을 5-mini로
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 KST = timezone(timedelta(hours=9))
+UTC = timezone.utc
 
-# 발행 시간(한국시간)과 허용 윈도우(분)
-# ⚠️ window_minutes=720(12시간)은 "아침/저녁 둘 다 언제든 발행"이 되어 중복 발행/원치 않는 타이밍이 생길 수 있습니다.
-# 정상 운영은 10~20분 권장입니다. (필요하면 workflow에서 env로 관리하세요)
-SCHEDULE = [
-    {"name": "AM", "hour": 8, "minute": 30, "window_minutes": 720},
-    {"name": "PM", "hour": 20, "minute": 30, "window_minutes": 720},
-]
+# 한 번 실행될 때 새 기사 몇 개까지 올릴지
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "2"))
 
-# 테스트용: 1이면 state 무시하고 강제 발행
+# 최근 몇 시간 기사만 대상으로 할지 (너무 넓으면 중복/노이즈 증가)
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "48"))
+
+# 강제 발행(디버그): 1이면 이미 올린 기사라도 상위 n개를 그냥 보냄(테스트용)
 FORCE_SEND = os.getenv("FORCE_SEND", "0") == "1"
-
-# 몇 개 올릴지
-TOP_K = int(os.getenv("TOP_K", "7"))
 
 # ---------------------------
 # Google News RSS (KR)
@@ -60,7 +52,7 @@ def build_google_news_feeds():
 RSS_FEEDS = build_google_news_feeds()
 
 # ---------------------------
-# Scoring weights (money-ish)
+# Money-ish keyword weights
 # ---------------------------
 KEYWORD_WEIGHTS = {
     # Memory/HBM
@@ -78,10 +70,30 @@ KEYWORD_WEIGHTS = {
     "엔비디아": 8, "nvidia": 8, "ai": 6, "데이터센터": 7, "서버": 6, "gpu": 6,
 }
 
+TOPIC_BUCKETS = [
+    ("HBM/메모리", ["hbm", "dram", "ddr5", "sk하이닉스", "하이닉스", "마이크론", "삼성전자", "메모리"]),
+    ("파운드리/공정", ["tsmc", "파운드리", "2나노", "3나노", "gaa", "gate-all-around"]),
+    ("장비/EUV", ["asml", "euv", "노광", "장비", "수율", "소재"]),
+    ("패키징/CoWoS", ["cowos", "첨단패키징", "칩렛", "패키징"]),
+    ("정책/리스크", ["수출규제", "제재", "규제", "관세", "중국"]),
+    ("AI 수요", ["엔비디아", "nvidia", "ai", "데이터센터", "서버", "gpu"]),
+    ("실적/투자", ["실적", "가이던스", "전망", "매출", "capex", "투자", "증설"]),
+]
+
+WHY_IMPORTANT_TEMPLATES = {
+    "HBM/메모리": "AI 수요(서버/GPU)와 직결되는 메모리 공급·가격 기대가 같이 움직이는 구간입니다.",
+    "파운드리/공정": "공정 경쟁은 고객사 수주·CAPEX·수율 이슈로 바로 이어질 수 있어 흐름 체크가 중요합니다.",
+    "장비/EUV": "장비/노광은 증설 속도와 수율을 좌우해서 ‘실제 공급 능력’의 선행지표로 읽히는 편입니다.",
+    "패키징/CoWoS": "패키징 병목은 출하량(=실적)과 연결되는 경우가 많아 단기 모멘텀으로 자주 언급됩니다.",
+    "정책/리스크": "규제/제재는 공급망 재편과 비용 증가로 이어질 수 있어 변동성 요인으로 작동합니다.",
+    "AI 수요": "AI 서버 투자와 연결되어 관련 기업의 가이던스/수주 기대가 같이 부각되기 쉽습니다.",
+    "실적/투자": "실적·가이던스·투자는 시장 기대치가 바뀌는 지점이라 반응이 빠르게 나오는 편입니다.",
+}
+
 # =========================
 # Utilities
 # =========================
-def load_state():
+def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -101,14 +113,28 @@ def append_archive(records: list[dict]):
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-def send_message(text: str):
+def normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def short_domain(link: str) -> str:
+    try:
+        return urlparse(link).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+def html_escape(s: str) -> str:
+    return html.escape(s or "", quote=True)
+
+def send_message(text_html: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": text,
+        "text": text_html,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -118,67 +144,36 @@ def send_message(text: str):
         print("Telegram response:", r.text[:300])
         r.raise_for_status()
 
-def within_window(now_kst: datetime, hour: int, minute: int, window_minutes: int) -> bool:
-    target = now_kst.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    start = target - timedelta(minutes=window_minutes)
-    end = target + timedelta(minutes=window_minutes)
-    return start <= now_kst <= end
-
-def normalize_text(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def is_recent(entry, now_kst: datetime, max_hours: int = 48) -> bool:
-    dt = None
+def parse_entry_time(entry) -> datetime | None:
+    # feedparser는 published_parsed / updated_parsed가 있으면 time.struct_time
     for key in ("published_parsed", "updated_parsed"):
-        if getattr(entry, key, None):
-            t = getattr(entry, key)
+        t = getattr(entry, key, None)
+        if t:
             try:
-                dt = datetime(*t[:6], tzinfo=timezone.utc).astimezone(KST)
-                break
+                return datetime(*t[:6], tzinfo=UTC)
             except Exception:
                 pass
+    return None
+
+def is_recent(entry, now_utc: datetime, max_hours: int) -> bool:
+    dt = parse_entry_time(entry)
     if dt is None:
         return True
-    return (now_kst - dt) <= timedelta(hours=max_hours)
+    return (now_utc - dt) <= timedelta(hours=max_hours)
 
-def dedupe_key(title: str, link: str) -> str:
-    base = normalize_text(title) + "|" + (link or "")
-    return hashlib.md5(base.encode("utf-8")).hexdigest()
+def _is_google_news_url(u: str) -> bool:
+    return "news.google.com" in (u or "")
 
-def short_domain(link: str) -> str:
-    try:
-        return urlparse(link).netloc.replace("www.", "")
-    except Exception:
-        return ""
+def extract_media_name(title: str) -> str:
+    # "... - 뉴데일리" 형태면 매체명만 뽑음
+    m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
+    return m.group(1).strip() if m else ""
 
-def clean_title(title: str, max_len: int = 78) -> str:
-    t = re.sub(r"\s+", " ", (title or "").strip())
-    if len(t) > max_len:
-        t = t[: max_len - 3] + "..."
-    return t
-
-def score_item(title: str, summary: str) -> int:
-    text = normalize_text(f"{title} {summary}")
-    score = 0
-    for k, w in KEYWORD_WEIGHTS.items():
-        if normalize_text(k) in text:
-            score += w
-    if re.search(r"\b(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T)\b", text):
-        score += 3
-    return score
-
-# ---------------------------
-# Better dedupe: normalize title + simple similarity
-# ---------------------------
 def strip_media_suffix(title: str) -> str:
-    # [속보] 같은 머리 제거
+    # 중복 제거용: [속보] + 끝의 "- 매체명" 제거 등
     t = (title or "").strip()
     t = re.sub(r"^\[[^\]]+\]\s*", "", t)
-    # 끝의 " - 매체명" 제거(대부분의 구글뉴스 제목에 붙음)
     t = re.sub(r"\s*-\s*[^-]+$", "", t)
-    # 따옴표/특수따옴표 제거
     t = re.sub(r"[\"“”’‘]", "", t)
     t = re.sub(r"\s+", " ", t)
     return t.strip().lower()
@@ -191,237 +186,260 @@ def is_similar(a: str, b: str) -> bool:
     j = len(sa & sb) / len(sa | sb)
     return j >= 0.85
 
-def extract_media_name(title: str) -> str:
-    # "... - 뉴데일리" -> "뉴데일리"
-    m = re.search(r"\s-\s([^-]+)$", (title or "").strip())
-    return m.group(1).strip() if m else ""
+def dedupe_key(title: str, orig_link: str) -> str:
+    base = strip_media_suffix(title) + "|" + (orig_link or "")
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
 
-def _is_google_news_url(u: str) -> bool:
-    return "news.google.com" in (u or "")
-
-# Google News RSS는 link가 news.google.com인 경우가 많아서 "진짜 원문 링크"를 뽑습니다.
 def extract_original_url(entry, item_link: str, summary_html: str) -> str:
     # 0) entry.links에서 외부 링크 우선
     try:
         for l in getattr(entry, "links", []) or []:
-            href = None
-            if isinstance(l, dict):
-                href = l.get("href")
-            else:
-                href = getattr(l, "href", None)
+            href = l.get("href") if isinstance(l, dict) else getattr(l, "href", None)
             if href and href.startswith("http") and (not _is_google_news_url(href)):
                 return href
     except Exception:
         pass
 
-    # 1) summary에서 href 추출
+    # 1) summary href
     m = re.search(r'href="(https?://[^"]+)"', summary_html or "")
     if m and (not _is_google_news_url(m.group(1))):
         return m.group(1)
 
-    # 2) summary에 plain url이 있는 경우
+    # 2) plain url
     m2 = re.search(r'(https?://[^\s"<]+)', summary_html or "")
     if m2 and (not _is_google_news_url(m2.group(1))):
         return m2.group(1)
 
-    # 3) fallback: item link 자체 (이 경우 google 링크일 수 있음)
+    # 3) fallback
     return item_link
 
-def fetch_top_news(now_kst: datetime, top_k: int = 7) -> list[dict]:
+def score_item(title: str, summary: str) -> int:
+    text = normalize_text(f"{title} {summary}")
+    score = 0
+    for k, w in KEYWORD_WEIGHTS.items():
+        if normalize_text(k) in text:
+            score += w
+    if re.search(r"\b(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T)\b", text):
+        score += 3
+    return score
+
+def detect_top_topic(title: str, summary: str) -> str:
+    text = normalize_text(f"{title} {summary}")
+    best = ("핵심 이슈", 0)
+    for name, keys in TOPIC_BUCKETS:
+        c = 0
+        for k in keys:
+            if normalize_text(k) in text:
+                c += 1
+        if c > best[1]:
+            best = (name, c)
+    return best[0]
+
+# =========================
+# Human-like summary builder (NO API)
+# =========================
+def strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def split_sentences(s: str) -> list[str]:
+    s = strip_html(s)
+    if not s:
+        return []
+    # 한국어/영문 혼합 문장 분리
+    parts = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s+|(?<=다\?)\s+|(?<=다!)\s+", s)
+    parts = [p.strip() for p in parts if p and p.strip()]
+    return parts
+
+def sentence_score(sent: str) -> int:
+    t = normalize_text(sent)
+    sc = 0
+    # 숫자/단위/퍼센트가 있으면 정보량 가산
+    if re.search(r"(\d+(\.\d+)?)(nm|%|조|억|만|B|M|T|배|원|달러)", sent):
+        sc += 4
+    # 돈 되는 키워드 가산
+    for k, w in KEYWORD_WEIGHTS.items():
+        if normalize_text(k) in t:
+            sc += min(3, w // 4)  # 과도한 점수 폭주 방지
+    # 행동 단어(투자/증설/가이던스 등)
+    if re.search(r"(투자|증설|가이던스|실적|수주|양산|출하|규제|제재|관세|수율|공급|부족|급등|하락)", sent):
+        sc += 2
+    return sc
+
+def pick_best_sentences(summary_html: str, k: int = 2, max_chars: int = 70) -> list[str]:
+    sents = split_sentences(summary_html)
+    if not sents:
+        return []
+
+    ranked = sorted(sents, key=sentence_score, reverse=True)
+    picked = []
+    for s in ranked:
+        s = re.sub(r"\s+", " ", s).strip()
+        if len(s) > max_chars:
+            s = s[: max_chars - 3] + "..."
+        if s and s not in picked:
+            picked.append(s)
+        if len(picked) >= k:
+            break
+    return picked
+
+def make_one_line_summary(title: str, topic: str) -> str:
+    # 단정 피하고 “~로 보입니다/~쪽이 부각됩니다” 톤
+    core = strip_media_suffix(title)
+    core = re.sub(r"\s+", " ", core).strip()
+    if len(core) > 42:
+        core = core[:39] + "..."
+    # 사람같은 문장 템플릿
+    return f"{topic} 이슈가 다시 부각됩니다: {core}"
+
+def build_feed_message(item: dict) -> str:
+    """
+    item: {title, summary, media, orig_link, score, published_kst}
+    텔레그램 HTML 메시지로 구성
+    """
+    title = item.get("title", "")
+    summary = item.get("summary", "")
+    media = item.get("media", "") or short_domain(item.get("orig_link", ""))
+    link = item.get("orig_link", "")
+    published_kst = item.get("published_kst", None)
+
+    topic = detect_top_topic(title, summary)
+    why = WHY_IMPORTANT_TEMPLATES.get(topic, "관련 기사들이 같은 방향으로 묶이는지 흐름을 체크해보시는 게 좋겠습니다.")
+    one_line = make_one_line_summary(title, topic)
+
+    # summary 발췌 2문장(인용 느낌)
+    picks = pick_best_sentences(summary, k=2, max_chars=78)
+    quote_lines = []
+    for p in picks:
+        quote_lines.append(f"• “{html_escape(p)}”")
+
+    # 시간 표기(선택)
+    time_line = ""
+    if isinstance(published_kst, datetime):
+        time_line = published_kst.strftime("%m/%d %H:%M")
+        time_line = f"<i>{html_escape(time_line)} (KST)</i>\n"
+
+    # 메시지 구성: 링크는 맨 마지막
+    msg = []
+    msg.append(f"<b>[Chip Signal] 업데이트</b>")
+    if time_line:
+        msg.append(time_line.strip())
+    msg.append(f"🧩 <b>한 줄 요약</b>: {html_escape(one_line)}")
+    if quote_lines:
+        msg.append("📌 <b>기사 요약(발췌)</b>:")
+        msg.extend(quote_lines)
+    msg.append(f"💡 <b>왜 중요?</b> {html_escape(why)}")
+
+    if media:
+        msg.append(f"📰 <b>출처</b>: {html_escape(media)}")
+
+    # 링크는 마지막 “첨부” 느낌
+    msg.append(f"🔗 <b>원문</b>: <a href=\"{html_escape(link)}\">기사 보기</a>")
+
+    msg.append("\n#반도체 #HBM #AI #파운드리 #장비 #패키징")
+    return "\n".join(msg)
+
+# =========================
+# Fetch & post
+# =========================
+def fetch_candidates(now_utc: datetime) -> list[dict]:
     items = []
-    seen = set()
-    norm_titles = []  # 유사도 중복 제거용
+    seen_norm_titles = []
 
     for source_name, url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:80]:
+            for e in feed.entries[:100]:
                 title = getattr(e, "title", "") or ""
                 link = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
 
                 if not title or not link:
                     continue
-                if not is_recent(e, now_kst, max_hours=48):
+                if not is_recent(e, now_utc, max_hours=LOOKBACK_HOURS):
                     continue
 
-                # 1차: title+link 해시 중복
-                key = dedupe_key(title, link)
-                if key in seen:
-                    continue
-
-                # 2차: 제목 정규화 유사도 중복(속보/따옴표/매체 꼬리 차이 제거)
                 norm = strip_media_suffix(title)
-                if any(is_similar(norm, nt) for nt in norm_titles):
+                if any(is_similar(norm, nt) for nt in seen_norm_titles):
                     continue
-
-                seen.add(key)
-                norm_titles.append(norm)
+                seen_norm_titles.append(norm)
 
                 orig = extract_original_url(e, link, summary)
-                s = score_item(title, summary)
+                sc = score_item(title, summary)
+                media = extract_media_name(title)
+
+                dt_utc = parse_entry_time(e)
+                dt_kst = dt_utc.astimezone(KST) if dt_utc else None
 
                 items.append({
                     "source": source_name,
                     "title": title.strip(),
                     "summary": summary.strip(),
-                    "link": link.strip(),         # google news link (backup)
-                    "orig_link": orig.strip(),    # publisher link (preferred)
-                    "score": s,
+                    "orig_link": orig.strip(),
+                    "score": sc,
+                    "media": media,
+                    "published_utc": dt_utc,
+                    "published_kst": dt_kst,
                 })
         except Exception as ex:
             print(f"[WARN] feed error: {source_name} - {ex}")
 
-    items.sort(key=lambda x: x["score"], reverse=True)
+    # “실시간 피드”는 최신성도 중요하니 published 우선 + 점수 보조
+    def sort_key(x):
+        ts = x["published_utc"].timestamp() if x["published_utc"] else 0
+        return (ts, x["score"])
 
-    filtered = [x for x in items if x["score"] >= 1]
-    if len(filtered) < top_k:
-        filtered = items[:top_k]
-    return filtered[:top_k]
+    items.sort(key=sort_key, reverse=True)
+    return items
 
-# =========================
-# LLM Insight
-# =========================
-def make_insight_block(items: list[dict]) -> str:
-    """
-    items: [{"title":..., "media":..., "orig_link":...}, ...]
-    Output:
-      ✅ 결론 1줄
-      🔥 핵심 3줄
-      📌 관전 포인트 1문장
-    """
-    if not client:
-        return ""
+def main():
+    now_utc = datetime.now(tz=UTC)
+    state = load_state()
 
-    lines = []
-    for i, it in enumerate(items, 1):
-        title = (it.get("title") or "").strip()
-        media = (it.get("media") or "").strip()
-        link = (it.get("orig_link") or "").strip()
-        # 링크는 프롬프트에만 제공(출력에는 링크 넣지 말라고 지시)
-        lines.append(f"{i}. [{media or '매체미상'}] {title} ({link})")
+    posted = state.get("posted", {})  # {dedupe_key: iso_ts}
+    if not isinstance(posted, dict):
+        posted = {}
 
-    prompt = f"""
-너는 한국어로 '돈 되는 반도체 뉴스' 텔레그램 브리핑을 쓰는 에디터다.
+    candidates = fetch_candidates(now_utc)
 
-규칙(중요):
-- 아래 기사 목록만 근거로 사용한다. 목록에 없는 사실/숫자/날짜/기업관계는 만들지 않는다.
-- 단정 금지: "~이다/확정" 대신 "~로 보입니다/가능성이 있습니다" 톤.
-- 너무 전문용어 금지. 초보도 이해 가능한 말로 쓴다.
-- 출력은 아래 형식만(링크/URL 출력 금지).
+    to_post = []
+    for it in candidates:
+        key = dedupe_key(it["title"], it["orig_link"])
+        if FORCE_SEND:
+            to_post.append((key, it))
+        else:
+            if key in posted:
+                continue
+            to_post.append((key, it))
+        if len(to_post) >= MAX_POSTS_PER_RUN:
+            break
 
-형식:
-✅ 결론: (20~40자 1문장)
-🔥 핵심:
-- (1문장)
-- (1문장)
-- (1문장)
-📌 관전 포인트: (1문장)
+    if not to_post:
+        print("No new items to post.")
+        return
 
-기사 목록:
-{chr(10).join(lines)}
-""".strip()
+    archive_rows = []
+    for key, it in to_post:
+        msg = build_feed_message(it)
+        send_message(msg)
 
-    try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-            max_output_tokens=240,
-        )
-        out = getattr(resp, "output_text", "") or ""
-        return out.strip()
-    except Exception as ex:
-        print("[WARN] OpenAI error:", ex)
-        return ""
+        posted[key] = now_utc.isoformat()
 
-# =========================
-# Post builder
-# =========================
-def build_post(slot_name: str, now_kst: datetime) -> tuple[str, list[dict]]:
-    if os.name == "nt":
-        date_str = now_kst.strftime("%m/%d").lstrip("0").replace("/0", "/")
-    else:
-        date_str = now_kst.strftime("%-m/%-d")
-
-    header = f"<b>[Chip Signal | {slot_name}] {date_str} {'아침 브리핑' if slot_name=='AM' else '저녁 정리'}</b>"
-    news = fetch_top_news(now_kst, top_k=TOP_K)
-
-    items = []
-    for it in news:
-        link = (it.get("orig_link") or it.get("link") or "").strip()
-        media = extract_media_name(it.get("title", ""))
-        items.append({
-            "title": it.get("title", ""),
-            "media": media,           # ✅ 도메인 대신 매체명
-            "orig_link": link,
-            "score": it.get("score", 0),
+        archive_rows.append({
+            "ts": now_utc.astimezone(KST).isoformat(),
+            "title": it["title"],
+            "media": it["media"] or short_domain(it["orig_link"]),
+            "link": it["orig_link"],
+            "score": it["score"],
+            "mode": "no_api_feed",
         })
 
-    insight = make_insight_block(items)
-
-    lines = [header]
-    if insight:
-        lines.append(insight)
-        lines.append("")
-
-    for i, it in enumerate(items, 1):
-        t = clean_title(it["title"], max_len=82)
-        lines.append(f"{i}) {t}")
-
-        # ✅ '출처: news.google.com' 같은 표기 없앰
-        # 매체명이 있으면 매체명, 없으면 출처 줄 생략하고 원문만.
-        if it["media"]:
-            lines.append(f"   - 출처: {it['media']} | <a href=\"{it['orig_link']}\">원문</a>\n")
-        else:
-            lines.append(f"   - <a href=\"{it['orig_link']}\">원문</a>\n")
-
-    lines.append("#반도체 #HBM #AI #파운드리 #장비 #패키징")
-    text = "\n".join(lines)
-    return text, items
-
-# =========================
-# Main
-# =========================
-def main():
-    now_kst = datetime.now(tz=KST)
-    today = now_kst.strftime("%Y-%m-%d")
-
-    state = load_state()
-    sent = state.get("sent", {})
-
-    if today not in sent:
-        sent[today] = {}
-
-    for slot in SCHEDULE:
-        name = slot["name"]
-
-        if (not FORCE_SEND) and sent[today].get(name):
-            print(f"Skip {name}: already sent today.")
-            continue
-
-        if within_window(now_kst, slot["hour"], slot["minute"], slot["window_minutes"]) or FORCE_SEND:
-            msg, items = build_post(name, now_kst)
-
-            records = []
-            for it in items:
-                records.append({
-                    "ts": now_kst.isoformat(),
-                    "slot": name,
-                    "title": it["title"],
-                    "media": it["media"],
-                    "link": it["orig_link"],
-                    "score": it["score"],
-                    "model": OPENAI_MODEL if OPENAI_API_KEY else None,
-                })
-            append_archive(records)
-
-            send_message(msg)
-            sent[today][name] = True
-            state["sent"] = sent
-            save_state(state)
-            print(f"✅ Sent {name} for {today}")
-        else:
-            print(f"⏳ Not in window for {name}. Now(KST): {now_kst.isoformat()}")
+    state["posted"] = posted
+    save_state(state)
+    append_archive(archive_rows)
+    print(f"Posted {len(to_post)} item(s).")
 
 if __name__ == "__main__":
     main()
